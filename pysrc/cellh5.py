@@ -1,6 +1,6 @@
 """
     The CellH5 Project
-    Copyright (c) 2012 - 2013 Christoph Sommer, Michael Held, Bernd Fischer
+    Copyright (c) 2012 - 2015 Christoph Sommer, Michael Held, Bernd Fischer
     Gerlich Lab, IMBA Vienna, Huber Lab, EMBL Heidelberg
     www.cellh5.org
 
@@ -11,41 +11,34 @@
 
 import sys
 import os
-import zlib
 import numpy
 import h5py
+import pandas
+import zlib
+import matplotlib.pyplot as plt
 
 import base64
 import warnings
 import unittest
-from itertools import chain, izip
+import datetime
+
 import functools
 import collections
-import datetime
+
+from itertools import chain, izip
 from collections import OrderedDict
-
-import pandas
-
-# import matplotlib
-# matplotlib.use('Qt4Agg', warn=False)
-import matplotlib.pyplot as mpl
-plt = mpl
+from contextlib import contextmanager
 
 from matplotlib.colors import hex2color
-from contextlib import contextmanager
-from collections import OrderedDict
+from hmm_wrapper import HMMConstraint, HMMAgnosticEstimator, normalize, hmm 
 
-from hmm_wrapper import HMMConstraint, HMMAgnosticEstimator, normalize, hmm
-
-
-version_num = (1, 1, 0)
+version_num = (1, 2, 0)
 version = '.'.join([str(n) for n in version_num])
-
 ICON_FILE = os.path.join(os.path.split(__file__)[0], "cellh5_icon.ico")
+
 GALLERY_SIZE = 80
 
 import logging
-
 log = logging.getLogger(__name__)
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.DEBUG)
@@ -53,6 +46,10 @@ log.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 ch.setFormatter(formatter)
 log.addHandler(ch)
+
+#####################
+### Helper functions
+#####################
 
 def pandas_apply(df, func):
     """Helper function for pandas DataFrame, when dealing with entries, which are numpy multi-dim arrays.
@@ -76,6 +73,10 @@ def pandas_ms_apply(df, func, n_cores=10):
     """Helper function for pandas DataFrame, when dealing with entries, which are numpy multi-dim arrays.
        Note, pandas integrated apply fun will drive you nuts...
        
+       IMPORTANT: differences to single core: pandas_apply
+          1) func must live at the module level
+          2) all extra args to func (e.g. used with partial) must be pickable
+       
        df: pandas DataFrame
        func: function expecting a row a Series over the columns of df
        
@@ -85,15 +86,103 @@ def pandas_ms_apply(df, func, n_cores=10):
     for _, row in df.iterrows():
         data.append(row)
     
-    pool = Pool(processes=9)
+    pool = Pool(processes=n_cores)
     res = pool.map(func, data)
+    pool.close()
     if isinstance(res[0], (tuple,)):
         return zip(*res)
     else:
         return res
 
-        
-    
+def repack_cellh5(cellh5_folder, output_file=None):
+    """Copies a cellh5 folder well-based into one single postition file"""
+    if output_file is None:
+        output_file = '%s/_all_positions_with_data.ch5' % cellh5_folder
+  
+    import glob, re
+    PLATE_PREFIX = '/sample/0/plate/'
+    WELL_PREFIX = PLATE_PREFIX + '%s/experiment/'
+    POSITION_PREFIX = WELL_PREFIX + '%s/position/'
+
+    def get_plate_and_postion(hf_file):
+        plate = hf_file[PLATE_PREFIX].keys()[0]
+        well = hf_file[WELL_PREFIX % plate].keys()[0]
+        position = hf_file[POSITION_PREFIX % (plate, well)].keys()[0]
+        return plate, well, position
+
+    flist = sorted(glob.glob('%s/*.ch5' % cellh5_folder))
+
+    f = h5py.File(output_file, 'w')
+
+    reg = re.compile('^[A-Z]\d{2}_\d{2}')
+    cnt = 0
+    for fname in flist:
+        if reg.search(os.path.split(fname)[1]) is not None:
+            print cnt, fname
+            if cnt == 0:
+                # write definition
+                fh = h5py.File(fname, 'r')
+                f.copy(fh['/definition'], 'definition')
+                fh.close()
+            # copy suff
+            fh = h5py.File(fname, 'r')
+            fplate, fwell, fpos = get_plate_and_postion(fh)
+            # print (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
+            f.copy(fh[(POSITION_PREFIX + '%s') % (fplate, fwell, fpos)], (POSITION_PREFIX + '%s') % (fplate, fwell, fpos))
+            fh.close()
+            cnt += 1
+    f.close()
+
+def repack_cellh5_and_combine(cellh5_folder, cellh5_folder_2, rel_path_src, rel_path_dest):
+    """Copies a cellh5 folder wellbased into one single postition file
+       and copies stuff from another cellh5 into that one (usefull if the same exp
+       ran twice)
+    """
+    import glob, re
+    PLATE_PREFIX = '/sample/0/plate/'
+    WELL_PREFIX = PLATE_PREFIX + '%s/experiment/'
+    POSITION_PREFIX = WELL_PREFIX + '%s/position/'
+
+    def get_plate_and_postion(hf_file):
+        plate = hf_file[PLATE_PREFIX].keys()[0]
+        well = hf_file[WELL_PREFIX % plate].keys()[0]
+        position = hf_file[POSITION_PREFIX % (plate, well)].keys()[0]
+        return plate, well, position
+
+    flist = sorted(glob.glob('%s/*.ch5' % cellh5_folder))
+
+    f = h5py.File('%s/_all_positions_with_data_combined.ch5' % cellh5_folder, 'w')
+
+    reg = re.compile('^[A-Z]\d{2}_\d{2}')
+    cnt = 0
+    for fname in flist:
+        if reg.search(os.path.split(fname)[1]) is not None:
+            print cnt, fname
+            if cnt == 0:
+                # write definition
+                fh = h5py.File(fname, 'r')
+                fh_2 = h5py.File(os.path.join(cellh5_folder_2, os.path.split(fname)[1]), 'r')
+                f.copy(fh['/definition'], 'definition')
+                for rps, rpd in zip(rel_path_src, rel_path_dest):
+                    f.copy(fh_2['/definition/%s' % rps], 'definition/%s' % rpd)
+
+                fh.close()
+                fh_2.close()
+            # copy suff
+            fh = h5py.File(fname, 'r')
+            fh_2 = h5py.File(os.path.join(cellh5_folder_2, os.path.split(fname)[1]), 'r')
+            fplate, fwell, fpos = get_plate_and_postion(fh)
+            # print (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
+            pos_path_in_ch5 = (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
+            f.copy(fh[pos_path_in_ch5], pos_path_in_ch5)
+            for rps, rpd in zip(rel_path_src, rel_path_dest):
+                f.copy(fh_2[pos_path_in_ch5 + ("/%s" % rps)], pos_path_in_ch5 + ("/%s" % rpd))
+
+            fh.close()
+            fh_2.close()
+            cnt += 1
+
+    f.close()
 
 def hex2rgb(color, mpl=False):
     """Return the rgb color as python int in the range 0-255."""
@@ -110,14 +199,12 @@ def to_index_array(value):
     """Convert list or tuple into an numpy.array. If value is integral, its
     packed into a list first.
     """
-
     if isinstance(value, numpy.ndarray):
         return value
     elif isinstance(value, (list, tuple)):
         return numpy.array(value)
     else:
         return numpy.array([value])
-
 
 @contextmanager
 def ch5open(filename, mode='r', cached=True):
@@ -132,9 +219,8 @@ def ch5open(filename, mode='r', cached=True):
     yield ch5
     ch5.close()
 
-
 class CH5Const(object):
-
+    """Container class for constants"""
     # defaults for unpredicted objects, -1 one might be not a
     UNPREDICTED_LABEL = -99
     UNPREDICTED_PROB = numpy.nan
@@ -142,9 +228,8 @@ class CH5Const(object):
     REGION = 'region'
     RELATION = 'relation'
 
-
 class CH5GroupCoordinate(object):
-
+    """CH5 Coordinates, sample, plate, well, position, region"""
     def __init__(self, region, position, well, plate, sample="0"):
         super(CH5GroupCoordinate, self).__init__()
 
@@ -154,23 +239,9 @@ class CH5GroupCoordinate(object):
         self.plate = plate
         self.sample = sample
 
-
 class memoize(object):
     """Cache the return value of a method
-
-   This class is meant to be used as a decorator of methods. The return value
-    from a given method invocation will be cached on the instance whose method
-    was invoked. All arguments passed to a method decorated with memoize must
-    be hashable.
-
-    If a memoized method is invoked directly on its class the result will not
-    be cached. Instead the method will be invoked like a static method:
-    class Obj(object_):
-        @memoize
-        def add_to(self, arg):
-            return self + arg
-    Obj.add_to(1) # not enough arguments
-    Obj.add_to(1, 2) # returns 3, result is not cached
+       make sure the arguments are hashable
     """
     def __init__(self, func):
         self.func = func
@@ -199,9 +270,8 @@ class memoize(object):
 
         return res
 
-
 class CH5Position(object):
-
+    """Main class for interacting with CH5 objects"""
     def __init__(self, plate, well, pos, grp_pos, parent):
         self.plate = plate
         self.well = well
@@ -303,7 +373,10 @@ class CH5Position(object):
                    [object_] \
                    [name].value
         else:
-            return []      
+            return []     
+        
+    def get_time_of_frame(self, frame):
+        return self['image/time_lapse']['timestamp_rel'][frame]
                    
     def get_time_lapse(self):
         if 'time_lapse' in self['image']:
@@ -805,18 +878,18 @@ class CH5Position(object):
         except:
             print "Error: Creation of %s in %s failed " % (feature_name, path)
             raise
-        
-        
-        
-
 
     def track_first(self, start_idx, max_length=None):
+        """Track an object based on the tracking information to the end. 
+           In case of spits, take the first element randomly"""
         return self._track_single(start_idx, 'first', max_length=max_length)
 
     def track_last(self, start_idx, max_length=None):
         return self._track_single(start_idx, 'last', max_length=max_length)
 
     def track_biggest(self, start_idx, max_length=None):
+        """Track an object based on the tracking information to the end. 
+           In case of spits, take the biggest element"""
         return self._track_single(start_idx, 'biggest', max_length=max_length)
     
     def track_backwards(self, end_idx, max_length=None):
@@ -848,6 +921,7 @@ class CH5Position(object):
             return res
 
 class CH5CachedPosition(CH5Position):
+    """Same as CH5Position using a cache for all inhereted methods"""
     def __init__(self, *args, **kwargs):
         super(CH5CachedPosition, self).__init__(*args, **kwargs)
 
@@ -916,6 +990,7 @@ class CH5CachedPosition(CH5Position):
             self._memoize__cache = {}
 
 class CH5File(object):
+    """CH5File object to open CH5 files"""
     def __init__(self, filename, mode='a', cached=True):
         self._cached = cached
         if isinstance(filename, basestring):
@@ -1071,6 +1146,7 @@ class CH5File(object):
             pass
 
 class CH5MappedFile(CH5File):
+    """Combine a CellH5 file with meta information from a mapping file, which contains information for each well"""
     def read_mapping(self, mapping_file, sites=None, rows=None, cols=None, locations=None, plate_name=''):
         self.mapping_file = mapping_file
         self.mapping = pandas.read_csv(self.mapping_file, sep='\t', dtype={'Well': str})
@@ -1091,14 +1167,12 @@ class CH5MappedFile(CH5File):
 
         self.mapping.reset_index(inplace=True)
         
-        
     def check_mapping(self, remove=False):
         self.mapping["CellH5"] = self.mapping.apply(lambda x: self.has_position(x["Well"], x["Site"]), axis=1)
         if remove:
             self.mapping = self.mapping[self.mapping["CellH5"]]
             self.mapping.reset_index(inplace=True)
         
-
     def _get_mapping_field_of_pos(self, well, pos, field):
         return self.mapping[(self.mapping['Well'] == str(well)) & \
              (self.mapping['Site'] == int(pos))][field].iloc[0]
@@ -1112,6 +1186,7 @@ class CH5MappedFile(CH5File):
         return self._get_mapping_field_of_pos(well, pos, treatment_column)
     
 class CH5MappedFileCollection(object):
+    """Several CellH5 files together with a mapping"""
     def __init__(self, name="CH5MappedFileCollection", mapping_files=None, cellh5_files=None,
                        sites=None, rows=None, cols=None, locations=None, init=True):
         self.name = name
@@ -1171,6 +1246,7 @@ class CH5MappedFileCollection(object):
 ####################        
 
 class CH5Analysis(CH5MappedFileCollection):
+    """Basic class used for common analysis task using CellH5, e. g. already contains PCA, etc"""
     def __init__(self, name="CH5Analysis", mapping_files=None, cellh5_files=None,
                        sites=None, rows=None, cols=None, locations=None, output_dir=None, init=True):
         CH5MappedFileCollection.__init__(self, name=name, mapping_files=mapping_files, cellh5_files=cellh5_files,
@@ -1195,7 +1271,7 @@ class CH5Analysis(CH5MappedFileCollection):
         if self.output_dir is None:
             debug = ""
             try:
-                import pydevd
+                import pydevd  # @UnresolvedImport
                 debug = "d_"
             except:
                 pass
@@ -1239,7 +1315,6 @@ class CH5Analysis(CH5MappedFileCollection):
             data = data[idx, :]
         
         self.cluster_class_on_all.fit(data)
-
         
         def _cluster_(xxx):
             if xxx["Object count"] > 0:
@@ -1360,7 +1435,6 @@ class CH5Analysis(CH5MappedFileCollection):
             matrix_i -= self.norm_mean
             matrix_i /= self.norm_stds    
             
-            
     def get_column_as_matrix(self, column_name, get_index=False):
         sel = self.mapping["Object count"] > 0
         data = self.mapping[sel][column_name]
@@ -1373,7 +1447,6 @@ class CH5Analysis(CH5MappedFileCollection):
     
     def get_data_sampled(self, in_group, in_classes, n_sample=10000, in_class_type = 'Object classification label', type_='Object features'):
         # Row selection
-        
         assert sum(in_classes.values()) - 1 < 0.000001
         object_count_sel = self.mapping['Object count'] > 0
         in_group_sel = self.mapping['Group'].isin(in_group)
@@ -1399,7 +1472,6 @@ class CH5Analysis(CH5MappedFileCollection):
             
         return res[indicies, :]
     
-    
     def get_data(self, in_group, type_='Object features', in_classes=None, in_class_type='Object classification label'):
         # Row selection
         object_count_sel = self.mapping['Object count'] > 0
@@ -1420,8 +1492,6 @@ class CH5Analysis(CH5MappedFileCollection):
         log.info('get_data for treatment %r with training matrix shape %r' % (list(selected['siRNA ID'].unique()), res.shape))
 
         return res
-
-
 
 class CH5FateAnalysis(CH5Analysis):
     """
@@ -1468,8 +1538,7 @@ class CH5FateAnalysis(CH5Analysis):
         str_+= "Caution: Class index will be used for all processing\n\n"
         return str_
                       
-    def track_events(self):
-        
+    def track_events(self):        
         def _track_events_(xxx):
             plate = xxx["Plate"]
             well = xxx["Well"]
@@ -1504,7 +1573,6 @@ class CH5FateAnalysis(CH5Analysis):
         self.hmm._set_emissionprob(est.emis) 
         
     def predict_hmm(self):
-
         def _hmm_predict_(xxx):
             plate = xxx["Plate"]
             well = xxx["Well"]
@@ -1543,30 +1611,74 @@ class CH5FateAnalysis(CH5Analysis):
             print "Plate '%s'\tWell '%s'\tSite '%s'" % (plate, well, site)
             print "*"*50
             for track_id, track in enumerate(track_labels):
-                print ident, "%03d:" % track_id, "".join(map(lambda xxx: pattern % xxx, track)) 
+                print ident, "%03d:" % track_id, "".join(map(lambda xxx: pattern % xxx, track))
                 
-    def show_track(self, event_id):
-        ids_1 = self.mapping["Track IDs"][0]
-        hmm_labels = self.mapping["HMM Track Labels"][0]
+    def report_to_csv(self, output_filename="report.txt", export_images=True):
+        import csv
+        header = ['Plate', 'Well', 'Site', 'Type', 'Event_id', 'Length', 'Frame_first_appearance', 'Class_first_appearance', 
+                  'Frames', 'Raw_classification', 'Hmm_classification']
         
-        plate = self.mapping["Plate"][0]
-        well = self.mapping["Well"][0]
-        site = self.mapping["Site"][0]
+        with open(output_filename, 'wb') as fh:
+            writer = csv.DictWriter(fh, header, delimiter="\t", lineterminator='\n')
+            writer.writeheader()
+            for i, xxx in self.mapping.iterrows():
+                plate = xxx["Plate"]
+                well = xxx["Well"]
+                site = xxx["Site"]
+                ch5_pos = self.get_ch5_position(plate, well, site)
+                
+                index_data = xxx["Track IDs"]
+                raw_data = xxx["Track Labels"]
+                hmm_data = xxx["HMM Track Labels"]
+                
+                assert len(index_data) == len(raw_data) == len(hmm_data)
+                
+                line_dict = {}
+                for e_id, (index, raw_class, hmm_class) in enumerate(zip(index_data, raw_data, hmm_data)):
+                    frames = ch5_pos.get_time_idx2(index)
+                    assert len(frames) == len(hmm_class) == len(raw_class)
+                    back_track =  ch5_pos.track_backwards(index[0])
+                    if len(back_track) > 0:
+                        start_index = back_track[0]
+                    else:
+                        start_index = index[0]
+                        
+                    start_frame = ch5_pos.get_time_idx(start_index)
+                    start_class = ch5_pos.get_class_name(start_index)
+                    
+                    line_dict['Event_id'] = e_id
+                    line_dict['Plate'] = plate
+                    line_dict['Well'] = well
+                    line_dict['Site'] = site
+                    line_dict['Type'] = "event"
+                    line_dict['Length'] = len(index)
+                    line_dict['Frame_first_appearance'] = start_frame
+                    line_dict['Class_first_appearance'] = start_class
+                    line_dict['Frames'] =  " ".join(map(str,frames))
+                    line_dict['Raw_classification'] = " ".join(map(str,raw_class))
+                    line_dict['Hmm_classification'] = " ".join(map(str,hmm_class))
+                    
+                    writer.writerow(line_dict)
+                    
+                    if export_images:
+                        import vigra
+                        img = self.get_track_image(plate, well, site, e_id)
+                        vigra.impex.writeImage(img.swapaxes(1,0), "%s_%s_%s_%d.png" % (plate, well, site, e_id))
+                    
+    def get_track_image(self, plate, well, site, event_id):
+        row = self.mapping[(self.mapping["Plate"] == plate) & (self.mapping["Well"] == well) & (self.mapping["Site"] == site)]
+        
+        ids_1 = row["Track IDs"][0]
+        hmm_labels = row["HMM Track Labels"][0]
         
         ch5_pos = self.get_ch5_position(plate, well, site)
         
-        img_1 = numpy.concatenate([ch5_pos.get_gallery_image_with_class(id) for id in ids_1[event_id]], 1)
+        img_1 = numpy.concatenate([ch5_pos.get_gallery_image_with_class(e_id) for e_id in ids_1[event_id]], 1)
         
         hmm_colors = [str(ch5_pos.definitions.class_definition()["color"][k]) for k in hmm_labels[event_id]]
-        img_2 = numpy.concatenate([ch5_pos.get_gallery_image_with_class(id, color=hmm_colors[k]) for k, id in enumerate(ids_1[event_id])], 1)
+        img_2 = numpy.concatenate([ch5_pos.get_gallery_image_with_class(e_id, color=hmm_colors[k]) for k, e_id in enumerate(ids_1[event_id])], 1)
         
-        
-        plt.imshow(numpy.concatenate((img_1, img_2)), interpolation='nearest')
-        plt.title("Uncorrected and corrected class labels for event with id %d" % event_id)
-        plt.gca().set_aspect(1)
-        plt.axis("off")
-        plt.tight_layout()
-        plt.show()
+        return numpy.concatenate((img_1, img_2))
              
 
 ##################
@@ -1575,7 +1687,7 @@ class CH5FateAnalysis(CH5Analysis):
 
 
 class CH5TestBase(unittest.TestCase):
-
+    """Unit test base class"""
     def setUp(self):
         data_filename = '../data/0038.ch5'
         if not os.path.exists(data_filename):
@@ -1591,6 +1703,7 @@ class CH5TestBase(unittest.TestCase):
         self.fh.close()
 
 class TestCH5Basic(CH5TestBase):
+    """Basic unit tests"""
     def testTimeLapse(self):
         time_lapse = self.pos.get_time_lapse()
         assert int(time_lapse) == 276
@@ -1610,7 +1723,6 @@ class TestCH5Basic(CH5TestBase):
         a1 = self.pos.get_gallery_image(tuple(event))
         a2 = self.pos.get_gallery_image(tuple(event), 'secondary__expanded')
 
-    
     def testGallery3(self):
         event = self.pos.get_events()[42][0]
         tracks = self.pos.track_all(event)
@@ -1657,6 +1769,7 @@ class TestCH5Basic(CH5TestBase):
         self.assertTrue(self.pos.get_object_features().shape[1] == 239)
         
 class TestCH5Write(CH5TestBase):
+    """Write unit tests"""
     def testSimpleWrite(self):
         data = numpy.random.rand(10, 20)
         self.pos.set_object_feature_data('_test', data)
@@ -1665,6 +1778,7 @@ class TestCH5Write(CH5TestBase):
         assert (data == data_).all()
 
 class TestCH5Examples(CH5TestBase):
+    """Example application used as unit tests"""
     def testBackwardTracking(self):
         events = self.pos.get_events()
         ev = events[1]
@@ -1684,8 +1798,8 @@ class TestCH5Examples(CH5TestBase):
         tub = self.pos.get_image(0, 1)
 
         # Print part of the images prepare image plot
-        fig = mpl.figure(frameon=False)
-        ax = mpl.Axes(fig, [0., 0., 1., 1.])
+        fig = plt.figure(frameon=False)
+        ax = plt.Axes(fig, [0., 0., 1., 1.])
         ax.set_axis_off()
         fig.add_axes(ax)
         ax.imshow(h2b[400:600, 400:600], cmap='gray')
@@ -1704,8 +1818,8 @@ class TestCH5Examples(CH5TestBase):
         center = self.pos.get_feature_table('primary__primary', 'center')
 
         # prepare image plot
-        fig = mpl.figure(frameon=False)
-        ax = mpl.Axes(fig, [0., 0., 1., 1.])
+        fig = plt.figure(frameon=False)
+        ax = plt.Axes(fig, [0., 0., 1., 1.])
         ax.set_axis_off()
         fig.add_axes(ax)
         ax.imshow(h2b, cmap='gray')
@@ -1747,7 +1861,7 @@ class TestCH5Examples(CH5TestBase):
             [predictions[nucleus['time_idx'] == time_idx]['label_idx'] for time_idx in range(time_max)]))
 
         # plot it
-        fig = mpl.figure()
+        fig = plt.figure()
         ax = fig.add_subplot(111)
 
         for i in range(1, n_classes):
@@ -1768,101 +1882,13 @@ class TestCH5Examples(CH5TestBase):
         for event in events[:5]:
             image.append(self.pos.get_gallery_image(tuple(event)))
 
-
-def repack_cellh5(cellh5_folder, output_file=None):
-    """copies a cellh5 folder wellbased into one single postition file"""
-    if output_file is None:
-        output_file = '%s/_all_positions_with_data.ch5' % cellh5_folder
-  
-    import glob, re
-    PLATE_PREFIX = '/sample/0/plate/'
-    WELL_PREFIX = PLATE_PREFIX + '%s/experiment/'
-    POSITION_PREFIX = WELL_PREFIX + '%s/position/'
-
-    def get_plate_and_postion(hf_file):
-        plate = hf_file[PLATE_PREFIX].keys()[0]
-        well = hf_file[WELL_PREFIX % plate].keys()[0]
-        position = hf_file[POSITION_PREFIX % (plate, well)].keys()[0]
-        return plate, well, position
-
-    flist = sorted(glob.glob('%s/*.ch5' % cellh5_folder))
-
-    f = h5py.File(output_file, 'w')
-
-    reg = re.compile('^[A-Z]\d{2}_\d{2}')
-    cnt = 0
-    for fname in flist:
-        if reg.search(os.path.split(fname)[1]) is not None:
-            print cnt, fname
-            if cnt == 0:
-                # write definition
-                fh = h5py.File(fname, 'r')
-                f.copy(fh['/definition'], 'definition')
-                fh.close()
-            # copy suff
-            fh = h5py.File(fname, 'r')
-            fplate, fwell, fpos = get_plate_and_postion(fh)
-            # print (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
-            f.copy(fh[(POSITION_PREFIX + '%s') % (fplate, fwell, fpos)], (POSITION_PREFIX + '%s') % (fplate, fwell, fpos))
-            fh.close()
-            cnt += 1
-    f.close()
-
-def repack_cellh5_and_combine(cellh5_folder, cellh5_folder_2, rel_path_src, rel_path_dest):
-    """copies a cellh5 folder wellbased into one single postition file
-       and copies stuff from another cellh5 into that one (usefull if the same exp
-       ran twice)
-    """
-    import glob, re
-    PLATE_PREFIX = '/sample/0/plate/'
-    WELL_PREFIX = PLATE_PREFIX + '%s/experiment/'
-    POSITION_PREFIX = WELL_PREFIX + '%s/position/'
-
-    def get_plate_and_postion(hf_file):
-        plate = hf_file[PLATE_PREFIX].keys()[0]
-        well = hf_file[WELL_PREFIX % plate].keys()[0]
-        position = hf_file[POSITION_PREFIX % (plate, well)].keys()[0]
-        return plate, well, position
-
-    flist = sorted(glob.glob('%s/*.ch5' % cellh5_folder))
-
-    f = h5py.File('%s/_all_positions_with_data_combined.ch5' % cellh5_folder, 'w')
-
-    reg = re.compile('^[A-Z]\d{2}_\d{2}')
-    cnt = 0
-    for fname in flist:
-        if reg.search(os.path.split(fname)[1]) is not None:
-            print cnt, fname
-            if cnt == 0:
-                # write definition
-                fh = h5py.File(fname, 'r')
-                fh_2 = h5py.File(os.path.join(cellh5_folder_2, os.path.split(fname)[1]), 'r')
-                f.copy(fh['/definition'], 'definition')
-                for rps, rpd in zip(rel_path_src, rel_path_dest):
-                    f.copy(fh_2['/definition/%s' % rps], 'definition/%s' % rpd)
-
-                fh.close()
-                fh_2.close()
-            # copy suff
-            fh = h5py.File(fname, 'r')
-            fh_2 = h5py.File(os.path.join(cellh5_folder_2, os.path.split(fname)[1]), 'r')
-            fplate, fwell, fpos = get_plate_and_postion(fh)
-            # print (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
-            pos_path_in_ch5 = (POSITION_PREFIX + '%s') % (fplate, fwell, fpos)
-            f.copy(fh[pos_path_in_ch5], pos_path_in_ch5)
-            for rps, rpd in zip(rel_path_src, rel_path_dest):
-                f.copy(fh_2[pos_path_in_ch5 + ("/%s" % rps)], pos_path_in_ch5 + ("/%s" % rpd))
-
-            fh.close()
-            fh_2.close()
-            cnt += 1
-
-    f.close()
     
 def run_single_test(cls, func):
+    """Helper function to run a single test"""
     writing = unittest.TestSuite()
     writing.addTest(cls(func))
     unittest.TextTestRunner().run(writing)
+
 
 if __name__ == '__main__':
 #     run_single_test(TestCH5Write, 'testBackwardTracking')
